@@ -62,7 +62,7 @@ namespace ism7mqtt
                 {"s|separate", "send values to separate mqtt topics - also disables json payload", x=> _useSeparateTopics = x != null},
                 {"retain", "retain mqtt messages", x=> _retain = x != null},
                 {"interval=", "push interval in seconds (defaults to 60)", (int x) => interval = x},
-                {"startup-timeout=", "timeout in seconds to wait for each pull request response during startup (defaults to 90)", (int x) => startupTimeout = x},
+                {"startup-timeout=", "timeout in seconds to connect to the ism7 and to wait for each pull request response during startup (defaults to 90)", (int x) => startupTimeout = x},
                 {"serialize-push-subscribes", "send push subscribes one at a time during startup, waiting for each response, instead of all at once (needed for some FW5.20 devices that otherwise stop responding; defaults to false)", x => serializePushSubscribes = x != null},
                 {"hass-id=", "HomeAssistant auto-discovery device id/entity prefix (implies --separate and --retain)", x => discoveryId = x},
                 {"l|lang=", "language for HA localization (DEU,CHN,GRC,EST,HRV,LVA,LTU,ROU,ITA,ESP,FRA,POL,CZE,SVK,RUS,DNK,HUN,GBR,TUR,NLD,BUL,POR)", x => language = x},
@@ -142,29 +142,50 @@ namespace ism7mqtt
                         await mqttClient.ConnectAsync(mqttOptions, cts.Token);
                         await mqttClient.SubscribeAsync($"Wolf/{ip}/+/set");
                         await mqttClient.SubscribeAsync($"Wolf/{ip}/+/set/#");
-                        var client = new Ism7Client((config, token) => OnMessage(mqttClient, config, enableDebug, token), parameter, ip, localizer, parameterXmlOverride)
+                        // the mqtt connection stays up while the ism7 connection is re-established with a fresh client
+                        var supervisor = new Ism7Supervisor(() =>
                         {
-                            Interval = interval,
-                            StartupTimeout = startupTimeout,
-                            SerializePushSubscribes = serializePushSubscribes,
+                            var client = new Ism7Client((config, token) => PublishNonFatalAsync(() => OnMessage(mqttClient, config, enableDebug, token), token), parameter, ip, localizer, parameterXmlOverride)
+                            {
+                                Interval = interval,
+                                StartupTimeout = startupTimeout,
+                                SerializePushSubscribes = serializePushSubscribes,
+                                EnableDebug = enableDebug
+                            };
+                            if (!String.IsNullOrEmpty(discoveryId))
+                            {
+                                client.OnInitializationFinishedAsync = (config, c) =>
+                                {
+                                    _haDiscovery =  new HaDiscovery(config, mqttClient, discoveryId, localizer)
+                                    {
+                                        EnableDebug = enableDebug,
+                                        QosLevel = _qos
+                                    };
+                                    return PublishNonFatalAsync(() => _haDiscovery.PublishDiscoveryInfo(c), c);
+                                };
+                            }
+                            return client;
+                        })
+                        {
                             EnableDebug = enableDebug
                         };
-                        mqttClient.ApplicationMessageReceivedAsync += x => OnMessage(client, x, enableDebug, cts.Token);
+                        mqttClient.ApplicationMessageReceivedAsync += async x =>
+                        {
+                            try
+                            {
+                                await OnMessage(supervisor.Current, x, enableDebug, cts.Token);
+                            }
+                            catch (Exception ex) when (!cts.IsCancellationRequested)
+                            {
+                                Console.Error.WriteLine($"failed to process mqtt message with topic '{x.ApplicationMessage.Topic}': {ex.Message}");
+                            }
+                        };
 
                         if (!String.IsNullOrEmpty(discoveryId))
                         {
                             await mqttClient.SubscribeAsync("homeassistant/status");
-                            client.OnInitializationFinishedAsync = (config, c) =>
-                            {
-                                _haDiscovery =  new HaDiscovery(config, mqttClient, discoveryId, localizer)
-                                {
-                                    EnableDebug = enableDebug, 
-                                    QosLevel = _qos
-                                };
-                                return _haDiscovery.PublishDiscoveryInfo(c);
-                            };
                         }
-                        await client.RunAsync(password, cts.Token);
+                        await supervisor.RunAsync(password, cts.Token);
                     }
                 }
                 catch (OperationCanceledException)
@@ -174,7 +195,8 @@ namespace ism7mqtt
                 {
                     Console.Error.WriteLine(ex);
                     cts.Cancel();
-                    throw;
+                    // the exception is already logged - rethrowing it would only abort the runtime (and dump core)
+                    Environment.ExitCode = 1;
                 }
             }
         }
@@ -220,6 +242,12 @@ namespace ism7mqtt
                 return _haDiscovery.PublishDiscoveryInfo(cancellationToken);
             }
 
+            if (client is null || !client.IsConnected)
+            {
+                Console.Error.WriteLine($"ism7 not connected - dropping mqtt message with topic '{message.Topic}'");
+                return Task.CompletedTask;
+            }
+
             if (message.Topic.EndsWith("/set"))
             {
                 //json
@@ -236,6 +264,20 @@ namespace ism7mqtt
                 topic = message.Topic.Substring(0, index);
                 var parts = property.Split('/');
                 return client.OnCommandAsync(topic, parts, message.ConvertPayloadToString(), cancellationToken);
+            }
+        }
+
+        // a broker outage must not end the ism7 connection - the mqtt client reconnects on its own and the
+        // discovery info is published again on homeassistant/status
+        private static async Task PublishNonFatalAsync(Func<Task> publish, CancellationToken cancellationToken)
+        {
+            try
+            {
+                await publish();
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                Console.Error.WriteLine($"mqtt publish failed: {ex.Message}");
             }
         }
 
